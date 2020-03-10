@@ -174,6 +174,7 @@ add_library(libslic3r STATIC
     Tesselate.hpp
     TriangleMesh.cpp
     TriangleMesh.hpp
+    TriangulateWall.hpp
     utils.cpp
     Utils.hpp
     Time.cpp

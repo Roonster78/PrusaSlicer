@@ -83,6 +83,10 @@ inline std::string to_string(const Vec3d   &pt) { return std::string("[") + std:
 std::vector<Vec3f> transform(const std::vector<Vec3f>& points, const Transform3f& t);
 Pointf3s transform(const Pointf3s& points, const Transform3d& t);
 
+template<class Vec> auto sq_distance(const Vec& p) { return p.transpose() * p; }
+template<class Vec> auto sq_distance(const Vec& pp1, const Vec& pp2) { return sq_distance(pp2 - pp1); }
+template<class...Args> double distance(Args &&...args) { return std::sqrt(double(sq_distance(std::forward<Args>(args)...))); }
+
 class Point : public Vec2crd
 {
 public:
