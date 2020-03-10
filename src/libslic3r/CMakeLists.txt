@@ -175,6 +175,8 @@ add_library(libslic3r STATIC
     TriangleMesh.cpp
     TriangleMesh.hpp
     TriangulateWall.hpp
+    TriangulateWallImpl.hpp
+    TriangulateWall.cpp
     utils.cpp
     Utils.hpp
     Time.cpp

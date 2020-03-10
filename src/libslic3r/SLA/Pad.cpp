@@ -11,6 +11,8 @@
 #include "Tesselate.hpp"
 #include "MTUtils.hpp"
 
+#include "TriangulateWall.hpp"
+
 // For debugging:
 // #include <fstream>
 // #include <libnest2d/tools/benchmark.h>
@@ -27,23 +29,6 @@ namespace Slic3r { namespace sla {
 
 namespace {
 
-/// This function will return a triangulation of a sheet connecting an upper
-/// and a lower plate given as input polygons. It will not triangulate the
-/// plates themselves only the sheet. The caller has to specify the lower and
-/// upper z levels in world coordinates as well as the offset difference
-/// between the sheets. If the lower_z_mm is higher than upper_z_mm or the
-/// offset difference is negative, the resulting triangle orientation will be
-/// reversed.
-///
-/// IMPORTANT: This is not a universal triangulation algorithm. It assumes
-/// that the lower and upper polygons are offsetted versions of the same
-/// original polygon. In general, it assumes that one of the polygons is
-/// completely inside the other. The offset difference is the reference
-/// distance from the inner polygon's perimeter to the outer polygon's
-/// perimeter. The real distance will be variable as the clipper offset has
-/// different strategies (rounding, etc...). This algorithm should have
-/// O(2n + 3m) complexity where n is the number of upper vertices and m is the
-/// number of lower vertices.
 Contour3D walls(
     const Polygon &lower,
     const Polygon &upper,
@@ -52,153 +37,201 @@ Contour3D walls(
     double         offset_difference_mm,
     ThrowOnCancel  thr = [] {})
 {
+    std::vector<size_t> triangles =
+        triangulate_wall(lower, upper, lower_z_mm, upper_z_mm,
+                         offset_difference_mm,
+                         [thr](int) { thr(); return false; });
+    
     Contour3D ret;
-
-    if(upper.points.size() < 3 || lower.size() < 3) return ret;
-
-    // The concept of the algorithm is relatively simple. It will try to find
-    // the closest vertices from the upper and the lower polygon and use those
-    // as starting points. Then it will create the triangles sequentially using
-    // an edge from the upper polygon and a vertex from the lower or vice versa,
-    // depending on the resulting triangle's quality.
-    // The quality is measured by a scalar value. So far it looks like it is
-    // enough to derive it from the slope of the triangle's two edges connecting
-    // the upper and the lower part. A reference slope is calculated from the
-    // height and the offset difference.
-
-    // Offset in the index array for the ceiling
-    const auto offs = upper.points.size();
-
-    // Shorthand for the vertex arrays
-    auto& upts = upper.points, &lpts = lower.points;
-    auto& rpts = ret.points; auto& ind = ret.faces3;
-
-    // If the Z levels are flipped, or the offset difference is negative, we
-    // will interpret that as the triangles normals should be inverted.
-    bool inverted = upper_z_mm < lower_z_mm || offset_difference_mm < 0;
-
+    
     // Copy the points into the mesh, convert them from 2D to 3D
-    rpts.reserve(upts.size() + lpts.size());
-    ind.reserve(2 * upts.size() + 2 * lpts.size());
-    for (auto &p : upts)
-        rpts.emplace_back(unscaled(p.x()), unscaled(p.y()), upper_z_mm);
-    for (auto &p : lpts)
-        rpts.emplace_back(unscaled(p.x()), unscaled(p.y()), lower_z_mm);
-
-    // Create pointing indices into vertex arrays. u-upper, l-lower
-    size_t uidx = 0, lidx = offs, unextidx = 1, lnextidx = offs + 1;
-
-    // Simple squared distance calculation.
-    auto distfn = [](const Vec3d& p1, const Vec3d& p2) {
-        auto p = p1 - p2; return p.transpose() * p;
-    };
-
-    // We need to find the closest point on lower polygon to the first point on
-    // the upper polygon. These will be our starting points.
-    double distmin = std::numeric_limits<double>::max();
-    for(size_t l = lidx; l < rpts.size(); ++l) {
-        thr();
-        double d = distfn(rpts[l], rpts[uidx]);
-        if(d < distmin) { lidx = l; distmin = d; }
-    }
-
-    // Set up lnextidx to be ahead of lidx in cyclic mode
-    lnextidx = lidx + 1;
-    if(lnextidx == rpts.size()) lnextidx = offs;
-
-    // This will be the flip switch to toggle between upper and lower triangle
-    // creation mode
-    enum class Proceed {
-        UPPER, // A segment from the upper polygon and one vertex from the lower
-        LOWER  // A segment from the lower polygon and one vertex from the upper
-    } proceed = Proceed::UPPER;
-
-    // Flags to help evaluating loop termination.
-    bool ustarted = false, lstarted = false;
-
-    // The variables for the fitness values, one for the actual and one for the
-    // previous.
-    double current_fit = 0, prev_fit = 0;
-
-    // Every triangle of the wall has two edges connecting the upper plate with
-    // the lower plate. From the length of these two edges and the zdiff we
-    // can calculate the momentary squared offset distance at a particular
-    // position on the wall. The average of the differences from the reference
-    // (squared) offset distance will give us the driving fitness value.
-    const double offsdiff2 = std::pow(offset_difference_mm, 2);
-    const double zdiff2 = std::pow(upper_z_mm - lower_z_mm, 2);
-
-    // Mark the current vertex iterator positions. If the iterators return to
-    // the same position, the loop can be terminated.
-    size_t uendidx = uidx, lendidx = lidx;
-
-    do { thr();  // check throw if canceled
-
-        prev_fit = current_fit;
-
-        switch(proceed) {   // proceed depending on the current state
-        case Proceed::UPPER:
-            if(!ustarted || uidx != uendidx) { // there are vertices remaining
-                // Get the 3D vertices in order
-                const Vec3d& p_up1 = rpts[uidx];
-                const Vec3d& p_low = rpts[lidx];
-                const Vec3d& p_up2 = rpts[unextidx];
-
-                // Calculate fitness: the average of the two connecting edges
-                double a = offsdiff2 - (distfn(p_up1, p_low) - zdiff2);
-                double b = offsdiff2 - (distfn(p_up2, p_low) - zdiff2);
-                current_fit = (std::abs(a) + std::abs(b)) / 2;
-
-                if(current_fit > prev_fit) { // fit is worse than previously
-                    proceed = Proceed::LOWER;
-                } else {    // good to go, create the triangle
-                    inverted
-                        ? ind.emplace_back(int(unextidx), int(lidx), int(uidx))
-                        : ind.emplace_back(int(uidx), int(lidx), int(unextidx));
-
-                    // Increment the iterators, rotate if necessary
-                    ++uidx; ++unextidx;
-                    if(unextidx == offs) unextidx = 0;
-                    if(uidx == offs) uidx = 0;
-
-                    ustarted = true;    // mark the movement of the iterators
-                    // so that the comparison to uendidx can be made correctly
-                }
-            } else proceed = Proceed::LOWER;
-
-            break;
-        case Proceed::LOWER:
-            // Mode with lower segment, upper vertex. Same structure:
-            if(!lstarted || lidx != lendidx) {
-                const Vec3d& p_low1 = rpts[lidx];
-                const Vec3d& p_low2 = rpts[lnextidx];
-                const Vec3d& p_up   = rpts[uidx];
-
-                double a = offsdiff2 - (distfn(p_up, p_low1) - zdiff2);
-                double b = offsdiff2 - (distfn(p_up, p_low2) - zdiff2);
-                current_fit = (std::abs(a) + std::abs(b)) / 2;
-
-                if(current_fit > prev_fit) {
-                    proceed = Proceed::UPPER;
-                } else {
-                    inverted
-                        ? ind.emplace_back(int(uidx), int(lnextidx), int(lidx))
-                        : ind.emplace_back(int(lidx), int(lnextidx), int(uidx));
-
-                    ++lidx; ++lnextidx;
-                    if(lnextidx == rpts.size()) lnextidx = offs;
-                    if(lidx == rpts.size()) lidx = offs;
-
-                    lstarted = true;
-                }
-            } else proceed = Proceed::UPPER;
-
-            break;
-        } // end of switch
-    } while(!ustarted || !lstarted || uidx != uendidx || lidx != lendidx);
+    ret.points.reserve(upper.points.size() + lower.points.size());
+    ret.faces3.reserve(2 * ret.points.size());
+    for (auto &p : upper.points)
+        ret.points.emplace_back(to_3d(unscaled(p), upper_z_mm));
+    for (auto &p : lower.points)
+        ret.points.emplace_back(to_3d(unscaled(p), lower_z_mm));
+    
+    size_t num_triangles = triangles.size() / 3;
+    for (size_t i = 0, i3 = 0; i < num_triangles; ++i, i3 = 3 * i)
+        ret.faces3.emplace_back(int(triangles[i3]), int(triangles[i3 + 1]),
+                                int(triangles[i3 + 2]));
 
     return ret;
 }
+
+///// This function will return a triangulation of a sheet connecting an upper
+///// and a lower plate given as input polygons. It will not triangulate the
+///// plates themselves only the sheet. The caller has to specify the lower and
+///// upper z levels in world coordinates as well as the offset difference
+///// between the sheets. If the lower_z_mm is higher than upper_z_mm or the
+///// offset difference is negative, the resulting triangle orientation will be
+///// reversed.
+/////
+///// IMPORTANT: This is not a universal triangulation algorithm. It assumes
+///// that the lower and upper polygons are offsetted versions of the same
+///// original polygon. In general, it assumes that one of the polygons is
+///// completely inside the other. The offset difference is the reference
+///// distance from the inner polygon's perimeter to the outer polygon's
+///// perimeter. The real distance will be variable as the clipper offset has
+///// different strategies (rounding, etc...). This algorithm should have
+///// O(2n + 3m) complexity where n is the number of upper vertices and m is the
+///// number of lower vertices.
+//Contour3D walls(
+//    const Polygon &lower,
+//    const Polygon &upper,
+//    double         lower_z_mm,
+//    double         upper_z_mm,
+//    double         offset_difference_mm,
+//    ThrowOnCancel  thr = [] {})
+//{
+//    Contour3D ret;
+
+//    if(upper.points.size() < 3 || lower.size() < 3) return ret;
+
+//    // The concept of the algorithm is relatively simple. It will try to find
+//    // the closest vertices from the upper and the lower polygon and use those
+//    // as starting points. Then it will create the triangles sequentially using
+//    // an edge from the upper polygon and a vertex from the lower or vice versa,
+//    // depending on the resulting triangle's quality.
+//    // The quality is measured by a scalar value. So far it looks like it is
+//    // enough to derive it from the slope of the triangle's two edges connecting
+//    // the upper and the lower part. A reference slope is calculated from the
+//    // height and the offset difference.
+
+//    // Offset in the index array for the ceiling
+//    const auto offs = upper.points.size();
+
+//    // Shorthand for the vertex arrays
+//    auto& upts = upper.points, &lpts = lower.points;
+//    auto& rpts = ret.points; auto& ind = ret.faces3;
+
+//    // If the Z levels are flipped, or the offset difference is negative, we
+//    // will interpret that as the triangles normals should be inverted.
+//    bool inverted = upper_z_mm < lower_z_mm || offset_difference_mm < 0;
+
+//    // Copy the points into the mesh, convert them from 2D to 3D
+//    rpts.reserve(upts.size() + lpts.size());
+//    ind.reserve(2 * upts.size() + 2 * lpts.size());
+//    for (auto &p : upts)
+//        rpts.emplace_back(unscaled(p.x()), unscaled(p.y()), upper_z_mm);
+//    for (auto &p : lpts)
+//        rpts.emplace_back(unscaled(p.x()), unscaled(p.y()), lower_z_mm);
+
+//    // Create pointing indices into vertex arrays. u-upper, l-lower
+//    size_t uidx = 0, lidx = offs, unextidx = 1, lnextidx = offs + 1;
+
+//    // Simple squared distance calculation.
+//    auto distfn = [](const Vec3d& p1, const Vec3d& p2) {
+//        auto p = p1 - p2; return p.transpose() * p;
+//    };
+
+//    // We need to find the closest point on lower polygon to the first point on
+//    // the upper polygon. These will be our starting points.
+//    double distmin = std::numeric_limits<double>::max();
+//    for(size_t l = lidx; l < rpts.size(); ++l) {
+//        thr();
+//        double d = distfn(rpts[l], rpts[uidx]);
+//        if(d < distmin) { lidx = l; distmin = d; }
+//    }
+
+//    // Set up lnextidx to be ahead of lidx in cyclic mode
+//    lnextidx = lidx + 1;
+//    if(lnextidx == rpts.size()) lnextidx = offs;
+
+//    // This will be the flip switch to toggle between upper and lower triangle
+//    // creation mode
+//    enum class Proceed {
+//        UPPER, // A segment from the upper polygon and one vertex from the lower
+//        LOWER  // A segment from the lower polygon and one vertex from the upper
+//    } proceed = Proceed::UPPER;
+
+//    // Flags to help evaluating loop termination.
+//    bool ustarted = false, lstarted = false;
+
+//    // The variables for the fitness values, one for the actual and one for the
+//    // previous.
+//    double current_fit = 0, prev_fit = 0;
+
+//    // Every triangle of the wall has two edges connecting the upper plate with
+//    // the lower plate. From the length of these two edges and the zdiff we
+//    // can calculate the momentary squared offset distance at a particular
+//    // position on the wall. The average of the differences from the reference
+//    // (squared) offset distance will give us the driving fitness value.
+//    const double offsdiff2 = std::pow(offset_difference_mm, 2);
+//    const double zdiff2 = std::pow(upper_z_mm - lower_z_mm, 2);
+
+//    // Mark the current vertex iterator positions. If the iterators return to
+//    // the same position, the loop can be terminated.
+//    size_t uendidx = uidx, lendidx = lidx;
+
+//    do { thr();  // check throw if canceled
+
+//        prev_fit = current_fit;
+
+//        switch(proceed) {   // proceed depending on the current state
+//        case Proceed::UPPER:
+//            if(!ustarted || uidx != uendidx) { // there are vertices remaining
+//                // Get the 3D vertices in order
+//                const Vec3d& p_up1 = rpts[uidx];
+//                const Vec3d& p_low = rpts[lidx];
+//                const Vec3d& p_up2 = rpts[unextidx];
+
+//                // Calculate fitness: the average of the two connecting edges
+//                double a = offsdiff2 - (distfn(p_up1, p_low) - zdiff2);
+//                double b = offsdiff2 - (distfn(p_up2, p_low) - zdiff2);
+//                current_fit = (std::abs(a) + std::abs(b)) / 2;
+
+//                if(current_fit > prev_fit) { // fit is worse than previously
+//                    proceed = Proceed::LOWER;
+//                } else {    // good to go, create the triangle
+//                    inverted
+//                        ? ind.emplace_back(int(unextidx), int(lidx), int(uidx))
+//                        : ind.emplace_back(int(uidx), int(lidx), int(unextidx));
+
+//                    // Increment the iterators, rotate if necessary
+//                    ++uidx; ++unextidx;
+//                    if(unextidx == offs) unextidx = 0;
+//                    if(uidx == offs) uidx = 0;
+
+//                    ustarted = true;    // mark the movement of the iterators
+//                    // so that the comparison to uendidx can be made correctly
+//                }
+//            } else proceed = Proceed::LOWER;
+
+//            break;
+//        case Proceed::LOWER:
+//            // Mode with lower segment, upper vertex. Same structure:
+//            if(!lstarted || lidx != lendidx) {
+//                const Vec3d& p_low1 = rpts[lidx];
+//                const Vec3d& p_low2 = rpts[lnextidx];
+//                const Vec3d& p_up   = rpts[uidx];
+
+//                double a = offsdiff2 - (distfn(p_up, p_low1) - zdiff2);
+//                double b = offsdiff2 - (distfn(p_up, p_low2) - zdiff2);
+//                current_fit = (std::abs(a) + std::abs(b)) / 2;
+
+//                if(current_fit > prev_fit) {
+//                    proceed = Proceed::UPPER;
+//                } else {
+//                    inverted
+//                        ? ind.emplace_back(int(uidx), int(lnextidx), int(lidx))
+//                        : ind.emplace_back(int(lidx), int(lnextidx), int(uidx));
+
+//                    ++lidx; ++lnextidx;
+//                    if(lnextidx == rpts.size()) lnextidx = offs;
+//                    if(lidx == rpts.size()) lidx = offs;
+
+//                    lstarted = true;
+//                }
+//            } else proceed = Proceed::UPPER;
+
+//            break;
+//        } // end of switch
+//    } while(!ustarted || !lstarted || uidx != uendidx || lidx != lendidx);
+
+//    return ret;
+//}
 
 // Same as walls() but with identical higher and lower polygons.
 Contour3D inline straight_walls(const Polygon &plate,
